@@ -12,9 +12,10 @@
 - `recall_core.py` — OS와 무관한 로직. 여기 바꾸면 `python -m pytest tests` 통과시킬 것
 - `screen_recall.py` — Windows 전용(ctypes, uiautomation, tkinter). 리눅스에서는 실행 불가, 문법 검사만 가능
 - `run.bat` — 비오님 PC에서 실행하는 입구
+- `diag.bat` — 진단 모드(`--diag`). 앱별로 접근성으로 읽히는 것만 출력, 추천·입력 안 함
 
 ## 다음 할 일 후보
-1. 비오님 PC에서 첫 실행 → 메모장·크롬·카톡에서 동작 확인, 문제 기록
+1. 비오님 PC에서 `diag.bat` → `run.bat` 순으로 첫 실행, 메모장·크롬·카톡 결과 기록 (README '첫 실행 점검' 표)
 2. 접근성으로 못 읽는 앱이 있으면 OCR(Windows 내장 OCR) 보조 추가
 3. 트레이 아이콘, PyInstaller로 exe 만들기
 4. 안드로이드 버전 설계

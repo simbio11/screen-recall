@@ -27,7 +27,7 @@ import tkinter as tk
 
 import uiautomation as auto
 
-from recall_core import RecallStore, is_hangul, tail_token
+from recall_core import RecallStore, is_hangul, tail_token, tokenize
 
 # ------------------------------------------------------------------ 설정
 SCAN_INTERVAL = 1.5          # 화면 글자 수집 주기(초)
@@ -128,6 +128,30 @@ user32.GetWindowThreadProcessId.restype = wt.DWORD
 user32.GetGUIThreadInfo.argtypes = [wt.DWORD, ctypes.POINTER(GUITHREADINFO)]
 user32.ClientToScreen.argtypes = [wt.HWND, ctypes.POINTER(wt.POINT)]
 user32.GetAsyncKeyState.restype = ctypes.c_short
+user32.GetWindowTextW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+user32.MonitorFromPoint.argtypes = [wt.POINT, wt.DWORD]
+user32.MonitorFromPoint.restype = wt.HMONITOR
+kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
+kernel32.GetModuleHandleW.restype = wt.HMODULE
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT), ("rcWork", wt.RECT),
+                ("dwFlags", wt.DWORD)]
+
+
+user32.GetMonitorInfoW.argtypes = [wt.HMONITOR, ctypes.POINTER(MONITORINFO)]
+MONITOR_DEFAULTTONEAREST = 2
+
+
+def work_area(x, y):
+    """(x, y)가 있는 모니터의 작업 영역 (왼, 위, 오른, 아래). 모니터 여러 대 대응."""
+    mi = MONITORINFO(cbSize=ctypes.sizeof(MONITORINFO))
+    hmon = user32.MonitorFromPoint(wt.POINT(int(x), int(y)), MONITOR_DEFAULTTONEAREST)
+    if hmon and user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+        r = mi.rcWork
+        return r.left, r.top, r.right, r.bottom
+    return None
 
 MY_PID = os.getpid()
 
@@ -201,7 +225,8 @@ class State:
         self.caret_at_end = True
         self.dismissed_prefix = None   # Esc/입력 직후: 이 접두어로는 다시 안 띄움
         self.paused = False
-        self.swallow_up = set()        # 가로챈 키다운의 짝 키업도 삼키기
+        self.swallow = {}              # 가로챈 키 -> 마지막 시각(ms). 짝 키업과 반복 키다운도 삼킴
+        self.busy_until = 0.0          # 추천 글자를 쳐 넣는 동안은 감시 멈춤
 
 
 store = RecallStore()
@@ -249,7 +274,7 @@ def control_text(ctrl):
 
 
 def scan_window(root):
-    """창 하나를 훑어 글자를 모음. 입력 중인 칸과 비밀번호 칸은 건너뜀."""
+    """창 하나를 훑어 (글자, 훑은 요소 수)를 돌려줌. 입력 중인 칸과 비밀번호 칸은 건너뜀."""
     texts = []
     deadline = time.time() + SCAN_MAX_SEC
     count = 0
@@ -274,7 +299,7 @@ def scan_window(root):
             child = _safe(lambda c=child: c.GetNextSiblingControl())
         for k in reversed(kids):
             stack.append((k, depth + 1))
-    return "\n".join(texts)
+    return "\n".join(texts), count
 
 
 # ------------------------------------------------------------------ 수집 스레드
@@ -300,7 +325,7 @@ def collector():
                 root = auto.ControlFromHandle(hwnd)
                 if root is None:
                     continue
-                text = scan_window(root)
+                text, _ = scan_window(root)
                 store.add_text(text)
             except Exception as e:  # 수집 실패는 조용히 넘어감
                 log("수집 오류:", e)
@@ -383,6 +408,8 @@ def watcher():
                 if state.visible:
                     hide_popup()
                 continue
+            if time.time() < state.busy_until:
+                continue  # 지우고 치는 중간 상태로 추천창이 깜빡이지 않게
             info = _safe(read_focused)
             if not info:
                 if state.visible:
@@ -422,23 +449,35 @@ def hide_popup():
 # ------------------------------------------------------------------ 키 훅
 def hook_thread():
     def proc(nCode, wParam, lParam):
-        if nCode == 0:
-            kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-            injected = bool(kb.flags & LLKHF_INJECTED)
-            vk = kb.vkCode
-            is_down = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
-            is_up = wParam in (WM_KEYUP, WM_SYSKEYUP)
-            if not injected:
-                if is_up and vk in state.swallow_up:
-                    state.swallow_up.discard(vk)
-                    return 1
-                if is_down and handle_key(vk):
-                    state.swallow_up.add(vk)
-                    return 1
+        try:
+            if nCode == 0:
+                kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                injected = bool(kb.flags & LLKHF_INJECTED)
+                vk = kb.vkCode
+                is_down = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
+                is_up = wParam in (WM_KEYUP, WM_SYSKEYUP)
+                if not injected:
+                    last = state.swallow.get(vk)
+                    if last is not None:
+                        if is_up:
+                            del state.swallow[vk]
+                            return 1
+                        # 가로챈 키를 계속 누르고 있으면 반복 키다운이 옴 -> 같이 삼킴
+                        # (안 그러면 Shift+Enter를 길게 눌렀을 때 줄바꿈이 들어감).
+                        # 키업을 놓쳤을 때 그 키가 영영 막히지 않도록 1.5초 간격 안에서만(키 반복 첫 지연은 최대 1초).
+                        if is_down and (kb.time - last) & 0xFFFFFFFF < 1500:
+                            state.swallow[vk] = kb.time
+                            return 1
+                        del state.swallow[vk]
+                    if is_down and handle_key(vk):
+                        state.swallow[vk] = kb.time
+                        return 1
+        except Exception as e:  # 훅에서 예외가 나도 키 입력은 막히지 않게
+            log("키 훅 오류:", e)
         return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
     cb = HOOKPROC(proc)  # 참조 유지 필수
-    hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, cb, None, 0)
+    hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, cb, kernel32.GetModuleHandleW(None), 0)
     if not hook:
         log("키보드 훅 설치 실패:", ctypes.get_last_error())
         return
@@ -473,6 +512,7 @@ def handle_key(vk):
             job = (state.prefix, text, state.caret_at_end)
             state.visible = False
             state.dismissed_prefix = text
+            state.busy_until = time.time() + 1.0
         ui_q.put(("hide", None))
         insert_q.put(job)
         return True
@@ -496,6 +536,7 @@ def handle_key(vk):
 def inserter():
     while True:
         prefix, text, at_end = insert_q.get()
+        state.busy_until = time.time() + 1.0
         time.sleep(0.03)
         # 사용자가 누르고 있는 Shift를 잠깐 떼어 줌(선택 영역이 생기지 않게)
         send_inputs([_key_input(VK_LSHIFT, 0, KEYEVENTF_KEYUP),
@@ -509,7 +550,8 @@ def inserter():
         tap(VK_BACK, times=len(prefix))
         time.sleep(0.02)
         type_unicode(text)
-        log(f"입력: {prefix!r} -> {text!r}")
+        state.busy_until = time.time() + 0.25  # 앱이 글자를 반영할 시간
+        log(f"입력: {len(prefix)}글자 -> {len(text)}글자 추천으로 바꿈")
 
 
 # ------------------------------------------------------------------ 추천창(tk)
@@ -559,10 +601,13 @@ class Popup:
         self.root.update_idletasks()
         w, h = self.root.winfo_reqwidth(), self.root.winfo_reqheight()
         x, y = int(self.pos[0]), int(self.pos[1]) + 4
-        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        x = max(0, min(x, sw - w))
-        if y + h > sh:
-            y = max(0, y - h - 28)
+        area = work_area(x, y)
+        if area is None:  # 모니터 정보를 못 얻으면 주 모니터 기준
+            area = (0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight())
+        left, top, right, bottom = area
+        x = max(left, min(x, right - w))
+        if y + h > bottom:
+            y = max(top, y - h - 28)
         user32.SetWindowPos(self.hwnd, HWND_TOPMOST, x, y, w, h,
                             SWP_NOACTIVATE | SWP_SHOWWINDOW)
 
@@ -584,10 +629,78 @@ class Popup:
         self.root.after(30, self.poll)
 
 
+# ------------------------------------------------------------------ 진단 모드
+def window_title(hwnd):
+    buf = ctypes.create_unicode_buffer(256)
+    user32.GetWindowTextW(hwnd, buf, 256)
+    return buf.value
+
+
+def diagnose():
+    """앱마다 접근성으로 무엇을 읽을 수 있는지 콘솔에 보여 줌(추천·입력은 안 함).
+
+    화면 글자 일부가 콘솔에 보이므로, 결과를 공유할 땐 민감한 글자를 지우고 보내세요.
+    """
+    log("진단 모드 — 확인할 앱을 앞으로 띄우고 입력 칸에 글자를 쳐 보세요. Ctrl+C로 종료.")
+    with auto.UIAutomationInitializerInThread():
+        last_hwnd = None
+        while True:
+            time.sleep(2)
+            hwnd, pid = foreground_pid()
+            if not hwnd or pid == MY_PID:
+                continue
+            if hwnd != last_hwnd:
+                last_hwnd = hwnd
+                name = process_name(pid)
+                print()
+                log(f"[창] {name} — {window_title(hwnd)[:40]!r}")
+                if name in EXCLUDE_PROCESSES:
+                    log("  제외 목록에 있는 프로그램이라 수집하지 않음")
+                    continue
+                t0 = time.time()
+                root = _safe(lambda: auto.ControlFromHandle(hwnd))
+                text, nodes = scan_window(root) if root else ("", 0)
+                toks = tokenize(text)
+                log(f"  수집: 요소 {nodes}개, {len(text)}글자, 후보 {len(toks)}개, "
+                    f"{time.time() - t0:.2f}초"
+                    + ("  ← 시간/개수 한도에 걸림" if nodes >= SCAN_MAX_NODES
+                       or time.time() - t0 >= SCAN_MAX_SEC else ""))
+                if toks:
+                    log("  예시:", " | ".join(t[:15] for t in toks[:8]))
+                else:
+                    log("  ※ 글자를 못 읽음 → 이 앱은 접근성 정보가 없을 수 있음(OCR 필요)")
+            ctrl = _safe(auto.GetFocusedControl)
+            if ctrl is None:
+                log("  [입력칸] 포커스 요소를 못 찾음")
+                continue
+            ctype = _safe(lambda: ctrl.ControlTypeName, "?")
+            cls = _safe(lambda: ctrl.ClassName, "")
+            fw = _safe(lambda: ctrl.FrameworkId, "")
+            has_tp = _safe(lambda: ctrl.GetPattern(auto.PatternId.TextPattern)) is not None
+            has_vp = _safe(lambda: ctrl.GetPattern(auto.PatternId.ValuePattern)) is not None
+            info = _safe(read_focused)
+            line = (f"  [입력칸] {ctype} class={cls!r} fw={fw!r} "
+                    f"Text={'O' if has_tp else 'X'} Value={'O' if has_vp else 'X'}")
+            if info:
+                before, at_end, pos = info
+                tail = (before or "")[-20:].replace("\r", "⏎").replace("\n", "⏎")
+                line += (f" | 커서앞={tail!r} 지금단어={tail_token(before)!r} "
+                         f"끝={'예' if at_end else '아니오'} 위치={pos}")
+            else:
+                line += " | 입력칸 아님/못 읽음"
+            log(line)
+
+
 # ------------------------------------------------------------------ 시작
 def main():
     if sys.platform != "win32":
         print("Windows에서만 동작합니다.")
+        return
+    if "--diag" in sys.argv:
+        try:
+            diagnose()
+        except KeyboardInterrupt:
+            pass
         return
     log("화면 기억 자동완성 시작 — 이 창을 닫으면 종료됩니다.")
     log("Shift+Enter 입력 · Shift+↑↓ 선택 · Esc 닫기 · "
